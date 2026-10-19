@@ -1,0 +1,6 @@
+dist/
+release/
+.tools/
+research/
+*.user
+*.suo
