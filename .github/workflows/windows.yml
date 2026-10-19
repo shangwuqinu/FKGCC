@@ -1,0 +1,114 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a preview release for the version in app.manifest
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  build:
+    name: Test and package Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      tag: ${{ steps.package.outputs.tag }}
+      artifact: ${{ steps.package.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run hardware-free tests
+        run: ./scripts/test.ps1
+
+      - name: Build GUI and CLI
+        run: ./scripts/build.ps1
+
+      - name: Package binaries and source
+        id: package
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          ./scripts/package.ps1
+          $info = Get-Content -LiteralPath release/package-info.json -Raw | ConvertFrom-Json
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -ne $info.tag) {
+            throw "Tag $env:REF_NAME does not match package tag $($info.tag)."
+          }
+          "version=$($info.version)" >> $env:GITHUB_OUTPUT
+          "tag=$($info.tag)" >> $env:GITHUB_OUTPUT
+          "artifact=$($info.name)" >> $env:GITHUB_OUTPUT
+
+      - name: Verify packaged CLI without hardware
+        run: |
+          $info = Get-Content -LiteralPath release/package-info.json -Raw | ConvertFrom-Json
+          $cli = Join-Path (Join-Path release $info.name) FKGCC.Cli.exe
+          $json = & $cli apply --mode cycle --color '#FF0000' --brightness 0 --dry-run
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged CLI failed.' }
+          $plan = $json | ConvertFrom-Json
+          if (-not $plan.DryRun -or $plan.Reports.Count -ne 6) { throw 'Unexpected packet plan.' }
+          foreach ($report in $plan.Reports[0..4]) {
+            $bytes = $report.Split(' ')
+            if ($bytes[11] -ne '01' -or ($bytes[14..17] -join ' ') -ne '00 00 00 00') {
+              throw 'Zero percent must emit static black.'
+            }
+          }
+
+      - name: Upload portable package and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: |
+            release/*.zip
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish preview release
+    needs: build
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: artifacts
+      - name: Create release from tested artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/*.zip artifacts/SHA256SUMS.txt \
+            --target "$COMMIT_SHA" \
+            --title "FKGCC Light $RELEASE_VERSION" \
+            --notes-file docs/RELEASE-NOTES.md \
+            --prerelease
